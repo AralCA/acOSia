@@ -106,6 +106,16 @@ public:
         if (neg) putc('-');
         while (i--) putc(buf2[i]);
     }
+
+    // direct cell write for the game (does not move the text cursor)
+    void put_at(int x, int y, char c, u8 col) {
+        buf[y * W + x] = (u16)(u8)c | ((u16)col << 8);
+    }
+    void hide_cursor() { outb(0x3D4, 0x0A); outb(0x3D5, 0x20); }
+    void show_cursor() {
+        outb(0x3D4, 0x0A); outb(0x3D5, 0x0E);
+        outb(0x3D4, 0x0B); outb(0x3D5, 0x0F);
+    }
 };
 
 // ============================================================
@@ -135,6 +145,17 @@ public:
                 if (c) return c;
             }
         }
+    }
+
+    // non-blocking: return a key, or -1 if nothing is waiting
+    int poll() {
+        if (inb(0x64) & 1) {
+            u8 sc = inb(0x60);
+            if (sc & 0x80) return -1;            // key release
+            char c = scancode_map[sc & 0x7F];
+            if (c) return (unsigned char)c;
+        }
+        return -1;
     }
 };
 
@@ -174,6 +195,227 @@ struct ScopeGuard {                              // RAII: destructor fires on sc
 };
 
 // ============================================================
+//  PIT (timer) polling for real-time pacing, since we have no
+//  interrupts. Channel 0 runs near 1.193182 MHz.
+// ============================================================
+static u16 pit_read() {
+    outb(0x43, 0x00);                        // latch channel 0
+    u8 lo = inb(0x40);
+    u8 hi = inb(0x40);
+    return (u16)(lo | (hi << 8));
+}
+static void pit_delay(u32 ms) {
+    u32 target = ms * 1193;                  // counts per millisecond
+    u32 elapsed = 0;
+    u16 prev = pit_read();
+    while (elapsed < target) {
+        u16 cur = pit_read();
+        elapsed += (u16)(prev - cur);        // counter counts down; u16 math handles wrap
+        prev = cur;
+    }
+}
+
+// ============================================================
+//  factory - a tiny Factorio-like game
+//  ------------------------------------------------------------
+//  A grid world with ore. Miners dig ore and push items onto
+//  belts; belts carry them to a hub, which scores them. Game
+//  state lives at a fixed scratch address so we need no heap.
+// ============================================================
+static const int MAPW = 80;
+static const int MAPH = 22;                  // screen: row 0 HUD, rows 1..22 map, 23/24 help
+static const int DX[4] = { 0, 1, 0, -1 };    // dir 0 up, 1 right, 2 down, 3 left
+static const int DY[4] = { -1, 0, 1, 0 };
+
+struct World {
+    u8 base [MAPH][MAPW];                     // 0 empty, 1 ore
+    u8 build[MAPH][MAPW];                     // 0 none, 1 belt, 2 miner, 3 hub
+    u8 dir  [MAPH][MAPW];                     // facing / flow direction
+    u8 item [MAPH][MAPW];                     // 0/1, an item riding a belt
+    u8 nit  [MAPH][MAPW];                     // next-tick scratch
+};
+
+class Game {
+    Vga& con;
+    Keyboard& kbd;
+    World* const w;                          // scratch RAM: no heap, no .bss
+    u32 seed;
+    int curx, cury;
+    int tool;                                // 1 belt, 2 miner, 3 hub
+    int tool_dir;                            // placement direction
+    u32 score;
+    u32 tick_count;
+    bool paused;
+
+    u32 rnd() { seed = seed * 1664525u + 1013904223u; return seed; }
+
+    static char belt_char(int d) {
+        return d == 0 ? '^' : d == 1 ? '>' : d == 2 ? 'v' : '<';
+    }
+    const char* tool_name() {
+        return tool == 1 ? "belt " : tool == 2 ? "miner" : "hub  ";
+    }
+    void text(int x, int y, const char* s, u8 col) {
+        while (*s) con.put_at(x++, y, *s++, col);
+    }
+    void num(int x, int y, u32 v, u8 col) {
+        char b[12]; int i = 0;
+        if (v == 0) { con.put_at(x, y, '0', col); return; }
+        while (v) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
+        while (i--) con.put_at(x++, y, b[i], col);
+    }
+
+    void init() {
+        con.hide_cursor();
+        con.clear();
+        seed = ((u32)pit_read() << 3) ^ 0xACED1234u;
+
+        for (int y = 0; y < MAPH; y++)
+            for (int x = 0; x < MAPW; x++) {
+                w->base[y][x]  = (rnd() % 100) < 7 ? 1 : 0;
+                w->build[y][x] = 0;
+                w->dir[y][x]   = 1;
+                w->item[y][x]  = 0;
+            }
+
+        // a small starter factory so the world is alive on entry
+        w->base[10][10] = 1; w->build[10][10] = 2; w->dir[10][10] = 1;   // miner on ore, facing right
+        for (int x = 11; x <= 14; x++) { w->build[10][x] = 1; w->dir[10][x] = 1; }
+        w->build[10][15] = 3;                                            // hub
+
+        curx = 20; cury = 10;
+        tool = 1; tool_dir = 1;
+        score = 0; tick_count = 0; paused = false;
+
+        for (int x = 0; x < MAPW; x++) { con.put_at(x, 23, ' ', 0x08); con.put_at(x, 24, ' ', 0x08); }
+        text(0, 23, "Move WASD   Place SPACE   Delete X   Rotate R   Tool: 1 belt  2 miner  3 hub", 0x07);
+        text(0, 24, "Pause P   Quit Q      Goal: miner on ore # -> belts -> hub H, raise the score", 0x07);
+    }
+
+    void draw_hud() {
+        for (int x = 0; x < MAPW; x++) con.put_at(x, 0, ' ', 0x1F);
+        text(1, 0, "acOSia factory", 0x1F);
+        text(18, 0, "score", 0x1F); num(24, 0, score, 0x1E);
+        text(32, 0, "tool", 0x1F);  text(37, 0, tool_name(), 0x1F);
+        text(45, 0, "dir", 0x1F);   con.put_at(49, 0, belt_char(tool_dir), 0x1F);
+        text(54, 0, "tick", 0x1F);  num(59, 0, tick_count, 0x1F);
+        if (paused) text(72, 0, "PAUSED", 0x1C);
+    }
+
+    void draw_map() {
+        for (int y = 0; y < MAPH; y++)
+            for (int x = 0; x < MAPW; x++) {
+                char ch; u8 col;
+                u8 b = w->build[y][x];
+                if (b == 1) {
+                    if (w->item[y][x]) { ch = 'o'; col = 0x0E; }
+                    else               { ch = belt_char(w->dir[y][x]); col = 0x0B; }
+                } else if (b == 2) {
+                    ch = 'M'; col = w->base[y][x] ? 0x0A : 0x0C;         // green on ore, else red
+                } else if (b == 3) {
+                    ch = 'H'; col = 0x0D;
+                } else if (w->base[y][x]) {
+                    ch = '#'; col = 0x06;
+                } else {
+                    ch = ' '; col = 0x00;
+                }
+                if (x == curx && y == cury) {                            // cursor: blue background
+                    if (ch == ' ') ch = '+';
+                    col = (u8)((col & 0x0F) | 0x10);
+                    if ((col & 0x0F) == 0) col = (u8)((col & 0xF0) | 0x0F);
+                }
+                con.put_at(x, y + 1, ch, col);
+            }
+    }
+
+    bool handle(int k) {
+        switch (k) {
+            case 'w': if (cury > 0)        cury--; break;
+            case 's': if (cury < MAPH - 1) cury++; break;
+            case 'a': if (curx > 0)        curx--; break;
+            case 'd': if (curx < MAPW - 1) curx++; break;
+            case '1': tool = 1; break;
+            case '2': tool = 2; break;
+            case '3': tool = 3; break;
+            case 'r': tool_dir = (tool_dir + 1) & 3; break;
+            case ' ':
+                w->build[cury][curx] = (u8)tool;
+                w->dir[cury][curx]   = (u8)tool_dir;
+                w->item[cury][curx]  = 0;
+                break;
+            case 'x':
+                w->build[cury][curx] = 0;
+                w->item[cury][curx]  = 0;
+                break;
+            case 'p': paused = !paused; break;
+            case 'q': return true;
+        }
+        return false;
+    }
+
+    void tick() {
+        memset(w->nit, 0, sizeof(w->nit));
+        // belts carry their item one tile forward
+        for (int y = 0; y < MAPH; y++)
+            for (int x = 0; x < MAPW; x++) {
+                if (w->build[y][x] != 1 || !w->item[y][x]) continue;
+                int d = w->dir[y][x];
+                int tx = x + DX[d], ty = y + DY[d];
+                bool moved = false;
+                if (tx >= 0 && tx < MAPW && ty >= 0 && ty < MAPH) {
+                    u8 tb = w->build[ty][tx];
+                    if (tb == 3) { score++; moved = true; }              // hub collects it
+                    else if (tb == 1 && !w->item[ty][tx] && !w->nit[ty][tx]) {
+                        w->nit[ty][tx] = 1; moved = true;
+                    }
+                }
+                if (!moved) w->nit[y][x] = 1;                            // blocked, stay put
+            }
+        // miners dig ore and drop items on the belt they face
+        if ((tick_count & 3) == 0) {
+            for (int y = 0; y < MAPH; y++)
+                for (int x = 0; x < MAPW; x++) {
+                    if (w->build[y][x] != 2 || !w->base[y][x]) continue;
+                    int d = w->dir[y][x];
+                    int tx = x + DX[d], ty = y + DY[d];
+                    if (tx >= 0 && tx < MAPW && ty >= 0 && ty < MAPH &&
+                        w->build[ty][tx] == 1 && !w->item[ty][tx] && !w->nit[ty][tx]) {
+                        w->nit[ty][tx] = 1;
+                    }
+                }
+        }
+        memcpy(w->item, w->nit, sizeof(w->item));
+        tick_count++;
+    }
+
+public:
+    Game(Vga& c, Keyboard& k)
+        : con(c), kbd(k), w((World*)0x00020000),
+          seed(1), curx(0), cury(0), tool(1), tool_dir(1),
+          score(0), tick_count(0), paused(false) {}
+
+    void run() {
+        init();
+        draw_hud();
+        draw_map();
+        u32 frame = 0;
+        for (;;) {
+            int k = kbd.poll();
+            bool quit = false;
+            while (k >= 0) { if (handle(k)) quit = true; k = kbd.poll(); }
+            if (quit) break;
+            if (!paused && (frame % 8) == 0) tick();
+            draw_hud();
+            draw_map();
+            frame++;
+            pit_delay(20);
+        }
+        con.show_cursor();
+        con.clear();
+    }
+};
+
+// ============================================================
 //  Shell
 // ============================================================
 class Shell {
@@ -199,6 +441,7 @@ class Shell {
         con.puts("Commands:\n");
         con.puts("  help     show this help\n");
         con.puts("  demo     show off C++ language features\n");
+        con.puts("  factory  play a tiny factory game (mini Factorio)\n");
         con.puts("  clear    clear the screen\n");
         con.puts("  echo X   print the text X\n");
         con.puts("  about    what is acOSia\n");
@@ -253,12 +496,18 @@ class Shell {
         con.puts("  all of the above: no std lib, no OS, ~9 KB of C++.\n");
     }
 
+    void cmd_factory() {
+        Game g(con, kbd);
+        g.run();
+    }
+
     void dispatch() {
         const char* s = line;
         if (s[0] == 0)             return;                    // empty line
         if (streq(s, "help"))   { cmd_help();   return; }
-        if (streq(s, "demo"))   { cmd_demo();   return; }
-        if (streq(s, "clear"))  { con.clear();  return; }
+        if (streq(s, "demo"))    { cmd_demo();    return; }
+        if (streq(s, "factory")) { cmd_factory(); return; }
+        if (streq(s, "clear"))   { con.clear();   return; }
         if (streq(s, "about"))  { cmd_about();  return; }
         if (streq(s, "ver"))    { cmd_about();  return; }
         if (streq(s, "reboot")) { cmd_reboot(); return; }
@@ -294,7 +543,7 @@ extern "C" void kmain() {
     con.puts("        a c O S i a   v2.0  (C++)\n");
     con.puts("   a 32-bit protected-mode C++ kernel\n");
     con.puts("========================================\n");
-    con.puts("Type 'demo' for a C++ tour, or 'help' for commands.\n\n");
+    con.puts("Type 'demo' for a C++ tour, 'factory' to play, or 'help'.\n\n");
 
     Shell shell(con, kbd);
     shell.run();                                 // never returns

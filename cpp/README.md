@@ -11,6 +11,17 @@ Type `demo` at the prompt for a live tour of C++ running on bare metal:
 templates, `constexpr`, operator overloading, virtual dispatch, RAII destructors,
 and colored output through the VGA driver (pictured above).
 
+Type `factory` for a small real-time factory game, a tiny take on Factorio. Place
+miners on ore, run belts to a hub, and watch items flow while the score climbs. A
+starter chain is already running the moment you enter.
+
+![the factory game](docs/factory.png)
+
+Controls: WASD to move, SPACE to place, X to delete, R to rotate, keys 1/2/3 to
+pick belt/miner/hub, P to pause, Q to quit. The simulation is paced by the PIT
+timer (no interrupts), input is polled, and all game state lives at a fixed
+scratch address so the kernel still needs no heap.
+
 ## What is different from the 16-bit version
 
 | | v1 (`../`) | v2 (this folder) |
