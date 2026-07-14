@@ -3,7 +3,9 @@
 The 32-bit protected-mode C++ kernel that ships alongside the 16-bit assembly OS
 in the parent folder. The bootloader is x86 assembly, but the kernel (VGA driver,
 keyboard driver, and shell) is freestanding C++. No standard library, no OS
-beneath it: the C++ code talks to the hardware directly.
+beneath it: the C++ code talks to the hardware directly. It installs an interrupt
+descriptor table, remaps the PIC, and runs a 100 Hz timer plus an interrupt-driven
+keyboard (see the `uptime` command).
 
 This is the clean core. The C++ feature demo and the factory game are kept in a
 separate repo: [AralCA/acOSia-cpp](https://github.com/AralCA/acOSia-cpp).
@@ -15,7 +17,7 @@ separate repo: [AralCA/acOSia-cpp](https://github.com/AralCA/acOSia-cpp).
 | CPU mode | 16-bit real mode | 32-bit protected mode |
 | Kernel language | assembly | freestanding C++ |
 | Screen output | BIOS `int 0x10` | own VGA driver (writes `0xB8000`) |
-| Keyboard | BIOS `int 0x16` | own PS/2 driver (polls `0x60`/`0x64`) |
+| Keyboard | BIOS `int 0x16` | own PS/2 driver, IRQ1 (interrupt-driven) |
 
 In protected mode the BIOS interrupt services are gone, so the C++ kernel
 implements its own drivers, which is what makes it interesting.
