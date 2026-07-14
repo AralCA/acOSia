@@ -6,9 +6,10 @@ assembly (NASM), with no operating system underneath it.
 
 ![acOSia booting in QEMU](docs/screenshot.png)
 
-> This repo is the 16-bit assembly OS. A C++ counterpart, a 32-bit
-> protected-mode kernel written in freestanding C++ with its own drivers, a
-> feature demo, and a factory game, lives in its own repo:
+> This repo has two kernels: the 16-bit assembly OS (here) and a 32-bit
+> protected-mode C++ core in [`cpp/`](cpp/) that boots the same way but writes
+> its own drivers in freestanding C++. The demo and factory-game extras for the
+> C++ build live in a separate repo:
 > [AralCA/acOSia-cpp](https://github.com/AralCA/acOSia-cpp).
 
 ## What it does
