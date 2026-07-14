@@ -12,8 +12,8 @@ typedef unsigned int       u32;
 typedef unsigned int       usize;
 
 // ------------------------------------------------------------
-//  Runtime helpers the compiler may emit calls to. In a hosted
-//  program libc provides these; here we are libc.
+//  Runtime bits the compiler may emit references to. In a hosted
+//  program libc / the C++ runtime provide these; here we are it.
 // ------------------------------------------------------------
 extern "C" void* memset(void* dst, int c, usize n) {
     u8* p = (u8*)dst;
@@ -25,6 +25,8 @@ extern "C" void* memcpy(void* dst, const void* src, usize n) {
     while (n--) *d++ = *s++;
     return dst;
 }
+// Referenced by an abstract class's vtable; never actually called here.
+extern "C" void __cxa_pure_virtual() { for (;;) { } }
 
 // ------------------------------------------------------------
 //  x86 port I/O
@@ -93,6 +95,17 @@ public:
         move_cursor();
     }
     void puts(const char* s) { while (*s) putc(*s++); }
+
+    // print a signed integer in base 10
+    void put_dec(int v) {
+        char buf2[12]; int i = 0;
+        bool neg = v < 0;
+        unsigned int u = neg ? (unsigned int)(-v) : (unsigned int)v;
+        if (u == 0) { putc('0'); return; }
+        while (u) { buf2[i++] = (char)('0' + (u % 10)); u /= 10; }
+        if (neg) putc('-');
+        while (i--) putc(buf2[i]);
+    }
 };
 
 // ============================================================
@@ -126,6 +139,41 @@ public:
 };
 
 // ============================================================
+//  Support types for the C++ feature demo
+// ============================================================
+template <typename T>
+static constexpr T kmax(T a, T b) { return a > b ? a : b; }
+
+static constexpr u32 fib(u32 n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+
+struct Vec2 {                                    // operator overloading
+    int x, y;
+    Vec2 operator+(const Vec2& o) const { return Vec2{ x + o.x, y + o.y }; }
+};
+
+struct Shape {                                   // polymorphism
+    virtual int area() const = 0;
+    virtual const char* name() const = 0;
+};
+struct Rect : Shape {
+    int w, h;
+    Rect(int a, int b) : w(a), h(b) {}
+    int area() const override { return w * h; }
+    const char* name() const override { return "Rect"; }
+};
+struct Square : Shape {
+    int s;
+    Square(int a) : s(a) {}
+    int area() const override { return s * s; }
+    const char* name() const override { return "Square"; }
+};
+
+struct ScopeGuard {                              // RAII: destructor fires on scope exit
+    Vga& con;
+    ~ScopeGuard() { con.puts("  [RAII]      destructor ran when scope exited\n"); }
+};
+
+// ============================================================
 //  Shell
 // ============================================================
 class Shell {
@@ -150,6 +198,7 @@ class Shell {
     void cmd_help() {
         con.puts("Commands:\n");
         con.puts("  help     show this help\n");
+        con.puts("  demo     show off C++ language features\n");
         con.puts("  clear    clear the screen\n");
         con.puts("  echo X   print the text X\n");
         con.puts("  about    what is acOSia\n");
@@ -169,10 +218,46 @@ class Shell {
         for (;;) asm volatile ("hlt");
     }
 
+    // Show real C++ features executing on bare metal.
+    void cmd_demo() {
+        con.puts("=== C++ language features, running on bare metal ===\n");
+
+        con.puts("  [template]   kmax(42, 17)        = ");
+        con.put_dec(kmax(42, 17)); con.putc('\n');
+
+        con.puts("  [template]   kmax('a','z')       = ");
+        con.putc(kmax('a', 'z')); con.putc('\n');
+
+        constexpr u32 f = fib(15);               // evaluated by the compiler
+        con.puts("  [constexpr]  fib(15) @ compile   = ");
+        con.put_dec((int)f); con.puts("   (no runtime cost)\n");
+
+        Vec2 v = Vec2{ 1, 2 } + Vec2{ 3, 4 };    // operator+
+        con.puts("  [operator+]  (1,2)+(3,4)         = (");
+        con.put_dec(v.x); con.puts(", "); con.put_dec(v.y); con.puts(")\n");
+
+        Rect r(10, 5); Square sq(6);             // virtual dispatch via base ptr
+        Shape* shapes[2] = { &r, &sq };
+        con.puts("  [virtual]    ");
+        for (int i = 0; i < 2; i++) {
+            con.puts(shapes[i]->name()); con.puts(" area=");
+            con.put_dec(shapes[i]->area()); con.puts("   ");
+        }
+        con.putc('\n');
+
+        con.puts("  [colors]     ");             // exercise the VGA color attribute
+        for (u8 c = 1; c <= 15; c++) { con.set_color((u8)(c << 4)); con.puts("  "); }
+        con.set_color(0x0F); con.putc('\n');
+
+        ScopeGuard g{ con };                     // its destructor prints on return
+        con.puts("  all of the above: no std lib, no OS, ~9 KB of C++.\n");
+    }
+
     void dispatch() {
         const char* s = line;
         if (s[0] == 0)             return;                    // empty line
         if (streq(s, "help"))   { cmd_help();   return; }
+        if (streq(s, "demo"))   { cmd_demo();   return; }
         if (streq(s, "clear"))  { con.clear();  return; }
         if (streq(s, "about"))  { cmd_about();  return; }
         if (streq(s, "ver"))    { cmd_about();  return; }
@@ -209,7 +294,7 @@ extern "C" void kmain() {
     con.puts("        a c O S i a   v2.0  (C++)\n");
     con.puts("   a 32-bit protected-mode C++ kernel\n");
     con.puts("========================================\n");
-    con.puts("Type 'help' for a list of commands.\n\n");
+    con.puts("Type 'demo' for a C++ tour, or 'help' for commands.\n\n");
 
     Shell shell(con, kbd);
     shell.run();                                 // never returns

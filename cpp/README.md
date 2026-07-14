@@ -5,6 +5,12 @@ assembly, but the kernel (VGA driver, keyboard driver, and the whole shell) is
 written in freestanding C++. No standard library, no OS beneath it: the C++
 code talks to the hardware directly.
 
+![acOSia v2 running](docs/screenshot.png)
+
+Type `demo` at the prompt for a live tour of C++ running on bare metal:
+templates, `constexpr`, operator overloading, virtual dispatch, RAII destructors,
+and colored output through the VGA driver (pictured above).
+
 ## What is different from the 16-bit version
 
 | | v1 (`../`) | v2 (this folder) |
@@ -57,6 +63,14 @@ Bare-metal C++ on a Windows/mingw toolchain has a few sharp edges, all handled i
 4. mingw's `ld` only emits PE, so we link a 32-bit PE with `.text` based at
    `0x10000`, then `objcopy -O binary` flattens the real sections into a raw
    kernel the bootloader can load and jump straight into.
+
+## Notes and next steps
+
+- The keyboard is polled, so no IDT or interrupts are needed yet. Adding an IDT,
+  a PIC remap, and an IRQ1 handler would make it interrupt-driven.
+- No shift or caps yet: the scancode table maps unshifted keys only.
+- Natural extensions: command history, a heap plus `new`/`delete`, colored text,
+  a `snake` game using the VGA driver.
 
 ## Files
 
