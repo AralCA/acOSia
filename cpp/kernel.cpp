@@ -93,6 +93,13 @@ public:
         move_cursor();
     }
     void puts(const char* s) { while (*s) putc(*s++); }
+
+    void put_dec(u32 v) {
+        char b[12]; int i = 0;
+        if (v == 0) { putc('0'); return; }
+        while (v) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
+        while (i--) putc(b[i]);
+    }
 };
 
 // ============================================================
@@ -110,17 +117,106 @@ static const char scancode_map[128] = {
     // 0x40..0x7F: unused -> 0
 };
 
+// ============================================================
+//  Interrupts: IDT, PIC remap, timer (IRQ0) and keyboard (IRQ1)
+//  ------------------------------------------------------------
+//  Handlers use GCC's interrupt attribute so they stay in C++.
+//  All mutable state lives at a fixed scratch address, so we
+//  still need no .bss (which the flat binary does not load).
+// ============================================================
+struct __attribute__((packed)) IdtEntry {
+    u16 off_lo; u16 sel; u8 zero; u8 type; u16 off_hi;
+};
+struct Kernel {
+    IdtEntry idt[256];
+    volatile u32 ticks;
+    volatile u8  kbuf[32];
+    volatile u32 khead, ktail;
+};
+static Kernel* const K = (Kernel*)0x00030000;
+
+struct InterruptFrame { u32 ip, cs, flags, sp, ss; };
+
+static void kbuf_push(u8 c) {
+    u32 nh = (K->khead + 1) & 31;
+    if (nh != K->ktail) { K->kbuf[K->khead] = c; K->khead = nh; }
+}
+
+__attribute__((interrupt))
+static void isr_exception(InterruptFrame*) {
+    const char* m = "** CPU exception - halted **";
+    volatile u16* v = (volatile u16*)0xB8000;
+    for (int i = 0; m[i]; i++) v[i] = (u16)(u8)m[i] | 0x4F00;   // white on red
+    for (;;) asm volatile ("cli; hlt");
+}
+__attribute__((interrupt))
+static void isr_timer(InterruptFrame*) {
+    K->ticks++;
+    outb(0x20, 0x20);                                          // end-of-interrupt to master PIC
+}
+__attribute__((interrupt))
+static void isr_keyboard(InterruptFrame*) {
+    u8 sc = inb(0x60);
+    if (!(sc & 0x80)) {                                        // ignore key releases
+        char c = scancode_map[sc & 0x7F];
+        if (c) kbuf_push((u8)c);
+    }
+    outb(0x20, 0x20);
+}
+__attribute__((interrupt))
+static void isr_irq_default(InterruptFrame*) {
+    outb(0x20, 0x20);
+}
+
+static void set_gate(int n, u32 addr) {
+    K->idt[n].off_lo = (u16)(addr & 0xFFFF);
+    K->idt[n].sel    = 0x08;                                   // GDT code selector
+    K->idt[n].zero   = 0;
+    K->idt[n].type   = 0x8E;                                   // present, ring 0, 32-bit interrupt gate
+    K->idt[n].off_hi = (u16)((addr >> 16) & 0xFFFF);
+}
+
+static void interrupts_init() {
+    K->ticks = 0; K->khead = 0; K->ktail = 0;
+
+    for (int i = 0;  i < 32; i++) set_gate(i, (u32)&isr_exception);   // CPU exceptions
+    for (int i = 32; i < 48; i++) set_gate(i, (u32)&isr_irq_default); // hardware IRQs
+    set_gate(32, (u32)&isr_timer);                                   // IRQ0
+    set_gate(33, (u32)&isr_keyboard);                                // IRQ1
+
+    // remap the PIC: IRQ0..15 -> vectors 0x20..0x2F (clear of CPU exceptions)
+    outb(0x20, 0x11); outb(0xA0, 0x11);
+    outb(0x21, 0x20); outb(0xA1, 0x28);
+    outb(0x21, 0x04); outb(0xA1, 0x02);
+    outb(0x21, 0x01); outb(0xA1, 0x01);
+    outb(0x21, 0xFC); outb(0xA1, 0xFF);                              // unmask IRQ0 and IRQ1 only
+
+    // PIT channel 0 at about 100 Hz
+    u32 div = 1193182u / 100u;
+    outb(0x43, 0x36);
+    outb(0x40, (u8)(div & 0xFF));
+    outb(0x40, (u8)((div >> 8) & 0xFF));
+
+    struct __attribute__((packed)) { u16 limit; u32 base; } idtr =
+        { (u16)(sizeof(K->idt) - 1), (u32)K->idt };
+    asm volatile ("lidt %0" :: "m"(idtr));
+    asm volatile ("sti");
+}
+
+// ============================================================
+//  PS/2 keyboard: reads from the interrupt-filled ring buffer
+// ============================================================
 class Keyboard {
 public:
-    // Block until a key with a printable/ASCII mapping is pressed.
+    // Block until a key is available, sleeping between interrupts.
     char getchar() {
         for (;;) {
-            if (inb(0x64) & 1) {                 // output buffer full?
-                u8 sc = inb(0x60);
-                if (sc & 0x80) continue;         // key release -> ignore
-                char c = scancode_map[sc & 0x7F];
-                if (c) return c;
+            if (K->ktail != K->khead) {
+                char c = (char)K->kbuf[K->ktail];
+                K->ktail = (K->ktail + 1) & 31;
+                return c;
             }
+            asm volatile ("hlt");
         }
     }
 };
@@ -154,12 +250,13 @@ class Shell {
         con.puts("  echo X   print the text X\n");
         con.puts("  about    what is acOSia\n");
         con.puts("  ver      version information\n");
+        con.puts("  uptime   time since boot, from the timer interrupt\n");
         con.puts("  reboot   restart the machine\n");
     }
     void cmd_about() {
         con.puts("acOSia v2.0\n");
         con.puts("A freestanding C++ kernel running in 32-bit protected mode.\n");
-        con.puts("It writes its own VGA text driver and PS/2 keyboard driver.\n");
+        con.puts("It has its own VGA driver, an IDT, and an interrupt-driven keyboard.\n");
         con.puts("No operating system and no standard library beneath it.\n");
     }
     void cmd_reboot() {
@@ -167,6 +264,18 @@ class Shell {
         while (inb(0x64) & 2) { }                // wait for 8042 input buffer
         outb(0x64, 0xFE);                        // pulse the CPU reset line
         for (;;) asm volatile ("hlt");
+    }
+    void cmd_uptime() {
+        u32 t = K->ticks;                        // incremented by the 100 Hz timer IRQ
+        con.puts("up ");
+        con.put_dec(t / 100);
+        con.putc('.');
+        u32 cs = t % 100;
+        if (cs < 10) con.putc('0');
+        con.put_dec(cs);
+        con.puts(" s  (");
+        con.put_dec(t);
+        con.puts(" timer ticks)\n");
     }
 
     void dispatch() {
@@ -176,6 +285,7 @@ class Shell {
         if (streq(s, "clear"))  { con.clear();  return; }
         if (streq(s, "about"))  { cmd_about();  return; }
         if (streq(s, "ver"))    { cmd_about();  return; }
+        if (streq(s, "uptime")) { cmd_uptime(); return; }
         if (streq(s, "reboot")) { cmd_reboot(); return; }
         if (s[0]=='e' && s[1]=='c' && s[2]=='h' && s[3]=='o') {
             if (s[4] == 0)   { con.putc('\n');                    return; }
@@ -202,6 +312,7 @@ public:
 extern "C" void kmain() {
     Vga con;
     Keyboard kbd;
+    interrupts_init();
 
     con.set_color(0x0F);
     con.clear();
