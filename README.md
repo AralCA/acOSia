@@ -6,9 +6,10 @@ assembly (NASM), with no operating system underneath it.
 
 ![acOSia booting in QEMU](docs/screenshot.png)
 
-> There are two versions. This folder is the original 16-bit assembly OS.
-> [`cpp/`](cpp/) is acOSia v2, a 32-bit protected-mode kernel written in
-> freestanding C++, with its own VGA text driver and PS/2 keyboard driver.
+> This repo is the 16-bit assembly OS. A C++ counterpart, a 32-bit
+> protected-mode kernel written in freestanding C++ with its own drivers, a
+> feature demo, and a factory game, lives in its own repo:
+> [AralCA/acOSia-cpp](https://github.com/AralCA/acOSia-cpp).
 
 ## What it does
 
