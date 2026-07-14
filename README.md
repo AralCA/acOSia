@@ -6,6 +6,10 @@ assembly (NASM), with no operating system underneath it.
 
 ![acOSia booting in QEMU](docs/screenshot.png)
 
+> There are two versions. This folder is the original 16-bit assembly OS.
+> [`cpp/`](cpp/) is acOSia v2, a 32-bit protected-mode kernel written in
+> freestanding C++, with its own VGA text driver and PS/2 keyboard driver.
+
 ## What it does
 
 - A stage-1 bootloader (512-byte boot sector) that the BIOS loads at `0x7C00`.
